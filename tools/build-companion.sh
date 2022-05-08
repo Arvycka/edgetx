@@ -4,49 +4,42 @@
 set -e
 set -x
 
-# Allow variable core usage
-# default uses all cpu cores
-#
-if [ -f /usr/bin/nproc ]; then
-    num_cpus=$(nproc)
-elif [ -f /usr/sbin/sysctl ]; then
-    num_cpus=$(sysctl -n hw.logicalcpu)
+if [ "$(uname)" = "Darwin" ]; then
+  num_cpus=$(sysctl -n hw.ncpu)
+  : "${JOBS:=$num_cpus}"
 else
-    num_cpus=2
+  JOBS=3
 fi
-: "${CORES:=$num_cpus}"
 
-# If no build target, exit
-#: "${FLAVOR:=ALL}"
-
-for i in "$@"
+while [ $# -gt 0 ]
 do
-case $i in
+  case "$1" in
     --jobs=*)
-      CORES="${i#*=}"
-      shift
-      ;;
+      JOBS="${1#*=}";;
     -j*)
-      CORES="${i#*j}"
-      shift
-      ;;
-    -Wno-error)
-      WERROR=0
-      shift
-      ;;
-    -b*)
-      FLAVOR="${i#*b}"
-      shift
-      ;;
-esac
+      JOBS="${1#*j}";;
+    -*)
+      echo >&2 "usage: $0 [-j<jobs>|--jobs=<jobs>] SRCDIR OUTDIR"
+      exit 1;;
+    *)
+      break;;   # terminate while loop
+  esac
+  shift
 done
 
-# Add GCC_ARM to PATH
-if [[ -n ${GCC_ARM} ]] ; then
-  export PATH=${GCC_ARM}:$PATH
-fi
+SRCDIR=$1
+OUTDIR=$2
 
-: "${SRCDIR:=$(dirname "$(pwd)/$0")/..}"
+COMMON_OPTIONS="-DGVARS=YES -DHELI=YES -DLUA=YES -Wno-dev -DCMAKE_BUILD_TYPE=Release"
+if [ "$(uname)" = "Darwin" ]; then
+    COMMON_OPTIONS="${COMMON_OPTIONS} -DCMAKE_OSX_DEPLOYMENT_TARGET='10.9'"
+elif [ "$(uname)" != "Linux" ]; then # Assume Windows and MSYS2
+    if [ "${MSYSTEM,,}" == "mingw32" ]; then # MSYS 32bit detected
+        COMMON_OPTIONS="${COMMON_OPTIONS} -DSDL_LIBRARY_PATH=/mingw32/bin/"
+    else # fallback to 64bit
+        COMMON_OPTIONS="${COMMON_OPTIONS} -DSDL_LIBRARY_PATH=/mingw64/bin/"
+    fi
+fi
 
 # Generate EDGETX_VERSION_SUFFIX if not already set
 if [[ -z ${EDGETX_VERSION_SUFFIX} ]]; then
@@ -66,30 +59,27 @@ if [[ -z ${EDGETX_VERSION_SUFFIX} ]]; then
   fi
 fi
 
-: "${BUILD_TYPE:=Release}"
-: "${COMMON_OPTIONS:="-DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_RULE_MESSAGES=OFF -Wno-dev "}"
-: "${EXTRA_OPTIONS:="$EXTRA_OPTIONS"}"
+rm -rf build
+mkdir build
+cd build
 
-COMMON_OPTIONS+=${EXTRA_OPTIONS}
+declare -a simulator_plugins=(x9lite x9lites
+                              x7 x7-access
+                              t8 t12 tx12
+                              zorro
+                              tlite tpro
+                              x9d x9dp x9dp2019 x9e
+                              xlite xlites
+                              nv14
+                              x10 x10-access x12s
+                              t16 t18 tx16s)
 
-: "${FIRMARE_TARGET:="firmware-size"}"
-
-# wipe build directory clean
-rm -rf build && mkdir -p build && cd build
-
-GIT_SHA_SHORT=$(git rev-parse --short HEAD)
-#GIT_TAG=`git describe --tags`
-
-target_names=$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]' | tr ';' '\n')
-
-for target_name in $target_names
+for plugin in "${simulator_plugins[@]}"
 do
-    fw_name="${target_name}-${GIT_SHA_SHORT}.bin"
-    BUILD_OPTIONS=${COMMON_OPTIONS}
+    BUILD_OPTIONS="${COMMON_OPTIONS} "
 
-    echo "Building ${fw_name}"
-    case $target_name in
-
+    echo "Building ${plugin}"
+    case $plugin in
         x9lite)
             BUILD_OPTIONS+="-DPCB=X9LITE"
             ;;
@@ -138,9 +128,6 @@ do
         x9e)
             BUILD_OPTIONS+="-DPCB=X9E"
             ;;
-        x9e-hall)
-            BUILD_OPTIONS+="-DPCB=X9E -DSTICKS=HORUS"
-            ;;
         x10)
             BUILD_OPTIONS+="-DPCB=X10"
             ;;
@@ -164,10 +151,20 @@ do
             ;;
     esac
 
+    rm -f CMakeCache.txt native/CMakeCache.txt
     cmake ${BUILD_OPTIONS} "${SRCDIR}"
-    cmake --build . --target arm-none-eabi-configure
-    cmake --build arm-none-eabi -j"${CORES}" --target ${FIRMARE_TARGET}
+    cmake --build . --target native-configure
+    cmake --build native -j"${JOBS}" --target libsimulator
+done                              
 
-    rm -f CMakeCache.txt arm-none-eabi/CMakeCache.txt
-    mv arm-none-eabi/firmware.bin "../${fw_name}"
-done
+cmake --build . --target native-configure
+if [ "$(uname)" = "Darwin" ]; then
+    cmake --build native -j"${JOBS}" --target package
+    cp native/*.dmg "${OUTDIR}"
+elif [ "$(uname)" = "Linux" ]; then
+    cmake --build native -j"${JOBS}" --target package
+    cp native/*.AppImage "${OUTDIR}"
+else
+    cmake --build native --target installer
+    cp native/companion/*.exe "${OUTDIR}"
+fi
